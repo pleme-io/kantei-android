@@ -314,4 +314,111 @@ mod tests {
         let profile = ComplianceProfile::from_yaml(GRAPHENEOS_HARDENED_PROFILE).unwrap();
         assert_eq!(profile.checks.len(), 6);
     }
+
+    #[test]
+    fn adb_transport_send_and_sync_bounds() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AdbTransport>();
+    }
+
+    #[test]
+    fn profile_check_ids_are_unique() {
+        let profile = grapheneos_profile();
+        let mut ids = std::collections::HashSet::new();
+        for check in &profile.checks {
+            assert!(
+                ids.insert(check.id()),
+                "duplicate check id: {}",
+                check.id()
+            );
+        }
+    }
+
+    #[test]
+    fn profile_has_at_least_five_checks() {
+        let profile = grapheneos_profile();
+        assert!(
+            profile.checks.len() >= 5,
+            "profile should have at least 5 checks, got {}",
+            profile.checks.len()
+        );
+    }
+
+    #[test]
+    fn mock_transport_selinux_enforcing_passes() {
+        let profile = grapheneos_profile();
+        let transport = compliant_transport();
+        let results = profile.evaluate_all(&transport);
+        let selinux = results.iter().find(|r| r.check_id == "GOS-SEL-001").unwrap();
+        assert_eq!(selinux.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn mock_transport_selinux_permissive_fails() {
+        let profile = grapheneos_profile();
+        let transport = MockTransport::new("pixel-8")
+            .with_property("ro.boot.verifiedbootstate", "green")
+            .with_property("ro.crypto.state", "encrypted")
+            .with_command("getenforce", "Permissive")
+            .with_property("ro.build.version.security_patch", "2026-03-01")
+            .with_property("persist.sys.usb.config", "none")
+            .with_property("ro.grapheneos.release_version", "2026030100");
+
+        let results = profile.evaluate_all(&transport);
+        let selinux = results.iter().find(|r| r.check_id == "GOS-SEL-001").unwrap();
+        assert_eq!(selinux.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn mock_transport_usb_debugging_enabled_fails() {
+        let profile = grapheneos_profile();
+        let transport = MockTransport::new("pixel-8")
+            .with_property("ro.boot.verifiedbootstate", "green")
+            .with_property("ro.crypto.state", "encrypted")
+            .with_command("getenforce", "Enforcing")
+            .with_property("ro.build.version.security_patch", "2026-03-01")
+            .with_property("persist.sys.usb.config", "mtp,adb")
+            .with_property("ro.grapheneos.release_version", "2026030100");
+
+        let results = profile.evaluate_all(&transport);
+        let usb = results.iter().find(|r| r.check_id == "GOS-USB-001").unwrap();
+        assert_eq!(usb.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn empty_property_causes_check_failure() {
+        let profile = grapheneos_profile();
+        // Transport with no properties at all — all property checks should error
+        let transport = MockTransport::new("pixel-8")
+            .with_command("getenforce", "Enforcing");
+
+        let results = profile.evaluate_all(&transport);
+        // All property-based checks should have Error status (property not found)
+        let property_checks: Vec<_> = results
+            .iter()
+            .filter(|r| r.check_id != "GOS-SEL-001")
+            .collect();
+        assert!(
+            property_checks.iter().all(|r| r.status == CheckStatus::Error),
+            "missing properties should produce Error status"
+        );
+    }
+
+    #[test]
+    fn compliance_report_json_serialization_roundtrip() {
+        let profile = grapheneos_profile();
+        let transport = compliant_transport();
+        let report = profile.report(&transport);
+
+        let json = report.to_json().unwrap();
+        let parsed: kantei::ComplianceReport = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.profile_name, report.profile_name);
+        assert_eq!(parsed.device_id, report.device_id);
+        assert_eq!(parsed.total, report.total);
+        assert_eq!(parsed.passed, report.passed);
+        assert_eq!(parsed.failed, report.failed);
+        assert_eq!(parsed.compliance_hash, report.compliance_hash);
+        assert!(parsed.is_compliant());
+    }
 }
